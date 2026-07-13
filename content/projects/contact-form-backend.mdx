@@ -1,0 +1,191 @@
+---
+title: Contact Form Backend
+---
+
+## The problem
+
+Static websites often need a contact form without needing an entire application backend. Sending submissions directly to email or storing every request without filtering creates a second problem: automated spam, repeated bot traffic, and no reliable way to review false positives.
+
+I built a reusable API that accepts contact-form submissions, filters spam in layers, stores reviewable results, protects administrative access, and can be connected to any static frontend.
+
+## Architecture
+
+The service uses FastAPI for the HTTP layer, SQLAlchemy for persistence, PostgreSQL on Neon in production, and SQLite for local development.
+
+The code separates the main concerns:
+
+```text
+app/
+├── config.py        # environment-backed settings
+├── database.py      # SQLAlchemy engine and sessions
+├── models.py        # persisted submissions
+├── schemas.py       # request and response validation
+├── security.py      # API-key dependency
+├── spam_filter.py   # pure heuristic scoring
+└── main.py          # routes, rate limiting, and CORS
+```
+
+The spam-scoring module has no framework or database dependency. That made it possible to test classification rules directly before introducing HTTP or persistence.
+
+## A layered spam strategy
+
+The API does not depend on a single spam signal. It applies three controls with different responsibilities.
+
+### Honeypot
+
+The public form includes a hidden `website` field. Real users leave it empty, while basic form-filling bots commonly populate it.
+
+A triggered honeypot submission is not stored.
+
+### Rate limiting
+
+Stored submissions are counted per IP address over a configurable time window. Once the request limit is reached, later submissions are silently rejected and are not written to the database.
+
+The limiter uses the database instead of process memory because the Render service can spin down between requests. An in-memory counter would disappear whenever the process restarted.
+
+### Heuristic scoring
+
+Submissions are scored using signals such as:
+
+- Spam keywords
+- Link count
+- Message length
+- Excessive uppercase text
+
+Messages meeting the configured threshold are stored with `status="spam"` instead of being discarded. This preserves false positives for review.
+
+## Identical public responses
+
+`POST /submit` always returns the same success response, regardless of whether the submission was clean, marked as spam, caught by the honeypot, or rate-limited:
+
+```json
+{
+  "status": "success"
+}
+```
+
+This is deliberate. Returning different responses would tell automated callers which filtering rule they triggered and make the system easier to probe.
+
+The public endpoint therefore reveals no classification information.
+
+## The short-message design decision
+
+An early scoring test used the message `"hi"` and expected it to be classified as spam. It scored below the spam threshold because message length was intentionally only a weak signal.
+
+That result raised a design question: should a short message be treated as spam by itself?
+
+I kept the original behavior.
+
+A terse message may still be a legitimate inquiry. What makes repeated short messages abusive is their volume, which is already handled by the rate limiter. Raising the short-message weight would duplicate rate-limiting responsibility inside the content classifier and increase false positives.
+
+The unexpected test result did not expose broken arithmetic. It confirmed the boundary between content scoring and traffic-volume control.
+
+## Protected review endpoint
+
+Stored submissions are retrieved through:
+
+```text
+GET /submissions
+```
+
+The route requires an `X-API-Key` header and supports:
+
+- Clean submissions only
+- Spam submissions only
+- All stored submissions
+- Pagination through `limit` and `offset`
+
+The endpoint defaults to clean submissions so the common review workflow does not require an additional filter.
+
+Requests with no key or an incorrect key receive `401 Unauthorized`.
+
+## CORS as an explicit security boundary
+
+The API accepts browser requests only from configured frontend origins.
+
+CORS required browser-based testing because command-line clients such as `curl` do not enforce browser origin policy.
+
+A local HTML file opened through `file://` produced a blocked request because the browser assigned it a `null` origin. This was expected behavior, not an API defect.
+
+The same page was then served from `http://localhost:5173`, an allowed origin, and the request succeeded. The negative and positive tests confirmed that disallowed browser origins were blocked while approved frontends could submit normally.
+
+## Configuration debugging
+
+The combined endpoint tests initially failed because the protected route rejected an API key that appeared to be configured.
+
+The project had no `.env` file—only `.env.example`—so the application was using its hardcoded development defaults.
+
+After creating `.env`, the server still rejected the new value. The running process had loaded environment variables before the file changed, and Uvicorn's source-code reload did not reread `.env`.
+
+Restarting the process loaded the correct configuration.
+
+This reinforced a practical debugging rule: configuration failures should be investigated by checking the actual process state—whether the file exists, where it is loaded from, and whether the process has restarted—not only by inspecting application code.
+
+## Deployment runtime failure
+
+The first Render build failed while installing `pydantic-core`.
+
+Render had selected Python 3.14 by default. A prebuilt wheel was unavailable for that runtime, so the build attempted to compile the Rust-based package from source and failed inside the managed build environment.
+
+Adding `runtime.txt` did not change the selected version because Render no longer used that mechanism for this deployment.
+
+The runtime was pinned to Python 3.11.9 using `.python-version`, with the same value also configured through Render's environment settings. The next deployment succeeded.
+
+The incident demonstrated why platform configuration must be verified against current provider behavior rather than older conventions.
+
+## Production persistence
+
+After deployment, the full submission workflow was repeated against the live service.
+
+A test submission was sent to the production endpoint and then retrieved through the protected review route. This confirmed that the service was writing to Neon PostgreSQL rather than silently using the local SQLite fallback on Render's ephemeral filesystem.
+
+The production CORS configuration was also tested through a browser from an allowed development origin.
+
+## Why email forwarding was deferred
+
+Email delivery was considered as a stretch feature but deliberately left out of the backend.
+
+The service is designed as a reusable filtering and storage component. Hardcoding one destination or notification provider would bind it to a specific downstream workflow before the consuming frontend's requirements were known.
+
+Clean submissions can later be forwarded through SMTP, Resend, SendGrid, a webhook, or another integration. That decision belongs at the integration boundary rather than inside the spam classifier itself.
+
+## Testing
+
+The project was verified layer by layer and then end to end.
+
+Checks covered:
+
+- Database connectivity
+- Actual generated table schema and indexes
+- Pydantic validation
+- Pure spam-score behavior
+- Clean submission storage
+- Honeypot rejection without persistence
+- Heuristic spam classification and reason storage
+- Per-IP rate limiting
+- API-key authentication
+- Status filtering and pagination
+- CORS rejection and acceptance
+- Production persistence on Neon
+- Live deployment behavior
+
+The rate-limit test sent six submissions in the configured window and verified through stored rows that only the first five were persisted.
+
+## Result
+
+The completed service provides:
+
+- A reusable public contact-form endpoint
+- Honeypot bot detection
+- Database-backed per-IP rate limiting
+- Reviewable heuristic spam classification
+- Identical public responses to avoid leaking filter behavior
+- Protected submission retrieval
+- Clean, spam, and combined status filtering
+- Configurable CORS origins
+- SQLite-based local development
+- PostgreSQL persistence in production
+- A health endpoint for deployment monitoring
+- A live Render deployment and Swagger interface
+
+The project is intentionally small, but it demonstrates security boundaries, layered filtering, environment-driven configuration, browser integration, persistent rate limiting, and production deployment without coupling the service to one specific frontend.

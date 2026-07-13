@@ -1,0 +1,165 @@
+---
+title: Invoice Generator API
+---
+
+## The problem
+
+Freelancers and small businesses need more than a CRUD interface for invoice records. The output has to be trustworthy as a business document: totals must be correct, invoice states must be enforced, tenant data must remain isolated, and the generated PDF must contain the exact information the user expects.
+
+I built a multi-tenant backend API that manages clients and invoices, calculates totals from nested line items, enforces an invoice lifecycle, and generates professional PDFs on demand.
+
+## Architecture
+
+The API uses FastAPI for the HTTP layer, SQLAlchemy for persistence, PostgreSQL for production data, Alembic for schema migrations, and JWT bearer authentication for tenant isolation.
+
+PDFs are rendered with Jinja2 and WeasyPrint. The invoice is first converted into HTML and CSS, then rendered into a downloadable PDF.
+
+The project is Dockerized end to end so the same image—and the same native WeasyPrint dependencies—run locally and in production.
+
+## Invoice lifecycle
+
+Invoices follow a constrained lifecycle:
+
+```text
+draft → sent → paid
+```
+
+A sent invoice is treated as a frozen business document. Once it leaves the draft state:
+
+- Invoice fields can no longer be edited.
+- Line items can no longer be added, changed, or deleted.
+- The invoice itself can no longer be deleted.
+
+`overdue` is not stored as a separate status. It is computed when a sent invoice is read and its due date has passed. This avoids duplicating state that can be derived from existing fields.
+
+## Totals and nested line items
+
+Invoices are created with nested line items. The API calculates subtotal, tax, and total from those items instead of trusting totals supplied by the client.
+
+This keeps the database authoritative and prevents malformed or manipulated requests from persisting inconsistent financial values.
+
+The same calculated values are used by both the JSON API and the PDF renderer, reducing the risk of the downloadable document disagreeing with the stored invoice.
+
+## Multi-tenant isolation
+
+Every client and invoice belongs to an authenticated user. Queries are scoped through that owner relationship so users can only view or mutate their own records.
+
+Attempts to access another tenant's resource return `404 Not Found` rather than `403 Forbidden`. This prevents the API from confirming that a particular client or invoice ID exists outside the caller's account.
+
+Authentication was added after the initial CRUD implementation. That change exposed the limitations of creating tables with `SQLAlchemy.create_all()`: it can create missing tables, but it does not safely evolve an existing schema.
+
+The project therefore moved to Alembic-managed migrations before deployment.
+
+## PDF generation
+
+WeasyPrint was chosen over a lower-level PDF library because visual quality was a core product requirement. HTML and CSS make layout, typography, tables, and branding significantly easier to control than manually positioning elements on a page.
+
+The tradeoff is a heavier runtime with native rendering dependencies. Docker contains that complexity and gives both development and production a consistent environment.
+
+The PDF endpoint returns a real rendered invoice:
+
+```text
+GET /invoices/{id}/pdf
+```
+
+## The production bug that changed the tests
+
+The first deployed PDFs were technically valid files but appeared completely blank.
+
+The debugging process ruled out browser corruption, missing production libraries, and obvious runtime exceptions. Inspection showed that the PDF contained almost no drawing instructions. A temporary measurement inside the rendering service then revealed the real problem: WeasyPrint was receiving an empty HTML string.
+
+The invoice template committed to the repository was still the original zero-line placeholder file. The intended template content had never actually replaced it on disk before the commit.
+
+The existing test only checked that the response:
+
+- Returned successfully.
+- Used the PDF content type.
+- Began with a valid PDF signature.
+- Exceeded a basic byte-size threshold.
+
+Those assertions proved the file was structurally plausible, not that it contained an invoice.
+
+I strengthened the test to extract text from the generated PDF and verify actual invoice content. This converted a weak format test into a behavioral test of the feature users depend on.
+
+## Deployment and migrations
+
+Local development used Docker Compose, where the API startup command already ran Alembic migrations before starting Uvicorn.
+
+Render, however, builds and runs the Dockerfile directly. It does not use the Compose command override. Without correction, the production container would start the API without applying migrations.
+
+The migration step was moved into the Dockerfile's own startup command:
+
+```dockerfile
+CMD ["sh", "-c", "alembic upgrade head && uvicorn app.main:app --host 0.0.0.0 --port 8000"]
+```
+
+This makes the image self-contained: any platform running it applies the schema before accepting traffic.
+
+## Reliability and recovery
+
+Several failures shaped the final engineering workflow.
+
+### Database readiness
+
+The API initially raced PostgreSQL during local startup. Docker's basic dependency ordering only guaranteed that the database container process had started, not that PostgreSQL was ready to accept connections.
+
+A database health check and readiness-aware dependency were added so the API waits for a usable database.
+
+### Password hashing
+
+The original authentication implementation used `passlib[bcrypt]`, inherited from an earlier project. A real dependency incompatibility caused hashing failures.
+
+Rather than pinning around an unmaintained wrapper, the project switched to bcrypt's maintained API directly.
+
+### Migration history
+
+Early Alembic attempts produced an empty initial revision, followed by a second migration that referenced the deleted first revision. The remaining migration had to be corrected into the true root of the revision chain.
+
+This reinforced that migration files form a dependency graph, not a disposable set of SQL scripts.
+
+### Source recovery
+
+A later archive extraction accidentally removed most files under several project directories while preserving only the small subset contained in the archive.
+
+Because the deleted files had already been committed, Git restored only those files without discarding the legitimate uncommitted changes. The incident demonstrated the practical value of frequent, bounded commits.
+
+## Security response
+
+A repository template file briefly contained a real signing secret and database credentials.
+
+Both credentials were rotated immediately and the deployment environment was updated. Git history was cleaned afterward, but rotation was treated as the actual remediation: once a secret has been pushed, removing it from visible history does not invalidate copies that may already exist.
+
+## Testing
+
+The final suite contains 57 tests covering:
+
+- Client CRUD
+- Invoice and line-item behavior
+- Totals calculation
+- Status transitions
+- Draft-lock enforcement
+- Invoice filtering
+- Authentication
+- Multi-tenant isolation
+- Alembic-backed application behavior
+- PDF generation and extracted document content
+
+The strongest lesson from the project was that a passing structural test can still provide false confidence. Tests should verify the user-visible behavior whenever that behavior can be inspected directly.
+
+## Result
+
+The completed API provides:
+
+- JWT-authenticated multi-tenant accounts
+- Client management
+- Nested invoice and line-item management
+- Server-calculated subtotal, tax, and total values
+- Draft, sent, paid, and computed overdue behavior
+- Draft-lock enforcement
+- Invoice filtering by client and status
+- Professional PDF generation
+- Docker-based local and production environments
+- Automatic Alembic migrations at container startup
+- A seeded demonstration account and deployed Swagger interface
+
+The project began as a short portfolio build, but evolved into a production-shaped backend where document correctness, tenant isolation, migration safety, and deployment parity are treated as core requirements.

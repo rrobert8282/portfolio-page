@@ -1,0 +1,133 @@
+---
+title: Appointment Scheduler API
+---
+
+## The problem
+
+Small service businesses lose money and trust when two clients can reserve overlapping appointments. The difficult part is not exposing booking endpoints; it is preserving scheduling correctness when multiple requests arrive at nearly the same time.
+
+I built a multi-tenant booking API for appointment-based businesses such as salons and tutors. Businesses manage staff, services, recurring availability, cancellation rules, and booking behavior. Clients can view open slots and book without creating an account.
+
+## Architecture
+
+The application uses FastAPI for the HTTP layer, SQLAlchemy 2.0 for persistence, Alembic for schema migrations, and PostgreSQL hosted on Neon. Business authentication uses JWTs, while all timezone conversion uses Python's `zoneinfo` module.
+
+The codebase is deliberately layered:
+
+- Routers handle HTTP concerns and response codes.
+- Services contain availability, booking, cancellation, and rescheduling logic.
+- Models define persisted state.
+- Pydantic schemas validate request and response data.
+- Authentication dependencies scope protected operations to the current business.
+
+This separation keeps the scheduling engine testable without starting the API server.
+
+## Preventing double-bookings
+
+Application-level conflict checks are not enough on their own. Two requests can both check that a slot is free before either transaction commits, allowing both inserts to proceed.
+
+The final guarantee therefore lives in PostgreSQL:
+
+```sql
+ALTER TABLE bookings
+ADD CONSTRAINT no_overlapping_bookings
+EXCLUDE USING gist (
+  staff_id WITH =,
+  tstzrange(start_at, end_at) WITH &&
+)
+WHERE (status != 'cancelled');
+```
+
+The exclusion constraint makes overlapping active bookings for the same staff member structurally impossible. The service layer catches the resulting integrity violation and converts it into a clean `409 Conflict` response.
+
+This behavior was verified twice: first through a direct database script, then again through concurrent-conflict scenarios against the live HTTP API.
+
+## Availability engine
+
+Availability is computed on demand instead of pre-generating and storing every possible slot.
+
+For a requested date, the engine:
+
+1. Anchors the calendar day in the business's IANA timezone.
+2. Loads the staff member's recurring availability rule.
+3. Generates candidate starts on a configurable grid, defaulting to 15 minutes.
+4. Expands existing bookings by their service buffer times.
+5. Removes candidates that overlap occupied windows.
+6. Returns the remaining slots in both UTC and business-local time.
+
+All persisted timestamps use UTC. Conversion only happens at system boundaries, avoiding hardcoded offsets and preserving correctness across daylight-saving transitions.
+
+## A test that changed the design
+
+The first version advanced through an availability window using the selected service's duration. For a 45-minute service, the generated sequence was `09:00`, `09:45`, `10:30`, and so on.
+
+A unit test expected `10:00` to become available after an earlier booking was removed, but that candidate could never exist under duration-based stepping. The test exposed a design flaw rather than a syntax error.
+
+I replaced duration-based stepping with a fixed slot grid. Service duration still determines whether an appointment fits, but it no longer controls which start times can be offered. The increment became configurable through `Business.settings`, because different businesses may prefer different booking intervals.
+
+## Multi-tenant behavior
+
+Management endpoints require a business JWT and automatically scope records to the authenticated tenant. Public booking and availability endpoints remain unauthenticated so clients do not need accounts merely to schedule an appointment.
+
+Business-specific variation is handled without weakening the relational model:
+
+- `Business.settings` stores behavioral configuration such as slot increments and cancellation windows.
+- `Booking.custom_fields` stores genuinely business-specific data that does not justify a dedicated column.
+
+This keeps core scheduling data strongly structured while preserving a controlled extension point.
+
+## Booking lifecycle
+
+The API supports the complete MVP booking flow:
+
+- Create a booking.
+- Reject overlaps with `409 Conflict`.
+- Cancel according to a configurable notice window.
+- Reopen cancelled time in subsequent availability results.
+- Reschedule by cancelling the original booking and creating a linked replacement.
+
+Rescheduling preserves history through `rescheduled_from_id` instead of mutating the original booking in place.
+
+## Reliability fixes
+
+Several implementation issues became useful engineering lessons.
+
+### Managed database connections
+
+Neon can close idle database connections. SQLAlchemy initially attempted to reuse those dead pooled connections, producing intermittent SSL errors after periods of inactivity.
+
+I enabled `pool_pre_ping=True` and set `pool_recycle=300`, allowing the application to detect stale connections and reconnect before executing a real query.
+
+### Password hashing dependency
+
+Signup initially failed with a misleading bcrypt password-length error. The actual cause was an incompatibility between a newer bcrypt release and the unmaintained `passlib` wrapper.
+
+Instead of pinning an older dependency around the problem, I removed `passlib` and used bcrypt's maintained `hashpw` and `checkpw` functions directly.
+
+### Deployment runtime
+
+Render initially selected a Python version too new for an available `pydantic-core` wheel, causing a source compilation failure during deployment. I pinned Python 3.12.3 and reinforced the setting through Render's environment configuration.
+
+The complete login, availability, booking, and conflict flow was then re-verified against the deployed application.
+
+## Testing
+
+The availability engine is unit-tested independently from the HTTP layer, including a daylight-saving boundary case. Booking conflicts, cancellation behavior, rescheduling, authentication, and tenant scoping were also verified end to end through the API.
+
+The project reinforced an important rule: tests should validate the intended behavior, not merely reproduce the current implementation. The most valuable test in this project failed because the implementation's underlying idea was wrong.
+
+## Result
+
+The completed MVP provides:
+
+- Multi-tenant business authentication
+- Staff, services, and recurring availability management
+- Timezone-aware and DST-safe slot generation
+- Configurable booking increments and cancellation windows
+- Service buffer handling
+- Race-condition-safe conflict prevention
+- Booking cancellation and history-preserving rescheduling
+- Per-business settings and custom booking fields
+- A deployed API with interactive Swagger documentation
+
+The project began as a portfolio backend, but its architecture was designed around a real operational requirement: safely handling appointment scheduling for an actual small service business.
