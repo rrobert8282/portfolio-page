@@ -15,7 +15,7 @@ const config: Config = {
         border: '#232A36',
         text: '#E4E7EB',
         muted: '#8B93A1',
-        signal: '#3DDC97',
+        signal: '#2DD4FF',
         amber: '#F5A623',
       },
       fontFamily: {
