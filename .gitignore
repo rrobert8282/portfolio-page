@@ -24,3 +24,4 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.tsproject-files.txt
+PORTFOLIO_STATE.md
