@@ -1,0 +1,162 @@
+---
+title: Task Manager (Gamified)
+---
+
+## The problem
+
+Most task manager   s provide a checklist but little motivation to complete it and little support for two people who want to stay accountable together.
+
+I built a full-stack task manager that combines daily, weekly, and date-based tasks with a coin economy, cosmetic customization, buddy collaboration, and real-time synchronization. Users earn coins by completing tasks, spend them on themes and sprite packs, and can share selected tasks with a linked buddy.
+
+The project began as a local prototype and evolved into a deployed application with responsive mobile behavior, PostgreSQL persistence, WebSockets, Google OAuth, and migration-managed schema changes.
+
+## Architecture
+
+The frontend uses React and Vite. FastAPI provides the HTTP and WebSocket backend, SQLAlchemy manages persistence, and JWTs authenticate application requests.
+
+Production is split across Vercel for the frontend, Render for the API and WebSocket service, and Neon for PostgreSQL. Local development falls back to SQLite when `DATABASE_URL` is not configured.
+
+The main frontend concerns are separated into task views, authentication, store behavior, profiles, buddy management, comments, and theme application. On the backend, routes, models, authentication, database configuration, Alembic migrations, and administrative cleanup are kept distinct.
+
+## Tasks and the reward economy
+
+Tasks are divided into daily, weekly, and date-based categories. They support optional repetition and can remain private or be marked as shared.
+
+Completing a task updates its state and awards coins. Both operations are handled by the backend so the client cannot independently claim currency.
+
+Coins can be spent on color schemes, fonts, backgrounds, and sprite-pack pieces. Each sprite pack contains four independently equipable parts: card, column, background overlay, and profile image.
+
+Users can buy individual pieces or purchase the remaining set as a discounted bundle:
+
+```text
+bundle price = sum(missing piece prices) × 0.8
+```
+
+Buying all four pieces separately automatically grants the completed pack, preventing the user from being charged again for an ownership state already earned.
+
+The theme engine also defines visual precedence. An equipped sprite replaces the corresponding color-scheme background where the two overlap instead of layering both unpredictably.
+
+## Buddy collaboration and authorization
+
+Users link through invite codes and can then view shared tasks, comment, react with emoji, and act on tasks deliberately exposed to the buddy relationship.
+
+The first implementation allowed buddies to see shared tasks but still restricted every mutation route to the original owner. A buddy could therefore view a task yet receive `403 Forbidden` when trying to complete, edit, or delete it.
+
+The authorization rule was centralized into a helper. A user may modify a task when they own it, or when it belongs to their linked buddy and is marked as shared.
+
+This changed sharing from a display-only flag into a permission rule applied consistently across update, completion, and deletion routes.
+
+The collaboration model also exposed an ORM lifecycle issue. Deleting a task with comments caused an integrity error because SQLAlchemy attempted to set the comments' required `task_id` values to `NULL`. Adding `cascade="all, delete-orphan"` made the intended relationship explicit: comments are children of a task and should be deleted with it.
+
+## Real-time synchronization
+
+Refreshing local task data after a mutation fixed only one side of the stale-interface problem. It did not update the buddy's open browser session.
+
+The backend therefore maintains authenticated WebSocket connections through a small connection manager. After a task mutation, it emits a `tasks_changed` event to the affected user and their buddy. Each client then refreshes the relevant task collections through the HTTP API.
+
+This keeps the socket payload intentionally small. The API remains the source of truth, while the WebSocket acts as an invalidation signal instead of duplicating complete task state across two transport layers.
+
+The implementation also revealed that a bare Uvicorn installation did not include the required WebSocket runtime. Installing the `websockets` dependency resolved the repeated connection failures.
+
+Cross-user updates were verified with separate authenticated sessions by creating, completing, and deleting shared tasks without refreshing either browser.
+
+## Mobile UX
+
+The original stylesheet contained media queries inherited from the Vite scaffold, but their selectors did not match the application's actual markup. Responsive rules technically existed while the real interface remained desktop-only.
+
+For narrow screens, I chose a tab switcher rather than stacking all three task columns or requiring horizontal scrolling. One active-column state controls the daily, weekly, and date views across the user's tasks, buddy tasks, and shared tasks.
+
+The store modal was also changed from a fixed width to a viewport-aware value:
+
+```css
+width: min(620px, 92vw);
+```
+
+The final behavior was checked in browser device emulation and on a real phone after deployment.
+
+## Production persistence and deployment
+
+The local application originally used SQLite. That was appropriate for development but unsafe on Render's free service because runtime filesystem changes are not durable across restarts and deployments.
+
+Database configuration was moved behind `DATABASE_URL`. Local development still uses SQLite by default, while production connects to Neon PostgreSQL.
+
+The frontend also originally hardcoded `http://127.0.0.1:8000`. Those references were replaced with `VITE_API_URL`, preserving a local fallback while allowing Vercel to inject the production backend address. The WebSocket endpoint is derived from the same base URL so HTTP and socket configuration cannot drift apart.
+
+The first backend deployment exposed an incomplete `requirements.txt`: the project worked locally because the virtual environment already contained its dependencies, but Render could not even start Uvicorn. Regenerating the dependency file from the known-working environment corrected the runtime.
+
+## Retrofitting migrations before OAuth
+
+Google OAuth required a nullable `google_sub` identifier and nullable password hashes for accounts created exclusively through Google.
+
+Before changing the schema, the project moved from `Base.metadata.create_all()` to Alembic. Because the local and production databases already contained the complete schema, I created an explicit no-op baseline migration rather than allowing the first revision to recreate existing tables.
+
+The baseline was applied locally with `alembic upgrade head` and recorded in production with `alembic stamp head`.
+
+The first real migration also had to support both PostgreSQL and SQLite. Alembic's autogenerated direct column alterations were unsuitable for SQLite, which cannot change column nullability in place. Rewriting the migration with `op.batch_alter_table(...)` allowed Alembic to recreate the SQLite table internally while remaining compatible with PostgreSQL.
+
+## Google sign-in and the missing production button
+
+Google verifies identity, but the backend still issues the same application JWT used by password-based accounts.
+
+The sign-in flow handles three cases:
+
+- A new Google identity creates an account without a local password.
+- A returning identity is matched by `google_sub`.
+- A verified Google email matching an existing password account links the two sign-in methods.
+
+Linking is restricted to Google's verified email claim rather than trusting a client-supplied email address.
+
+After deployment, the Google button worked locally but disappeared completely from production. The expected commit had deployed, the Google script was present, and forcing a no-cache Vercel build did not restore it.
+
+The decisive check was the compiled bundle itself. A local production build contained the Google code; Vercel's bundle did not.
+
+The frontend variable had been configured as `GOOGLE_CLIENT_ID`, matching the backend name, instead of `VITE_GOOGLE_CLIENT_ID`. Vite exposes only variables with the `VITE_` prefix. The missing value became `undefined` without a build error, and dead-code elimination removed the conditionally rendered button from the final bundle.
+
+Renaming the variable restored the feature. New-account creation, returning login, and verified-email linking were then tested against the live deployment.
+
+## Administrative safety and scope
+
+Deleting a user touches tasks, comments, purchases, buddy links, invites, and application-state records. A standalone administrative script removes these rows in foreign-key-safe order inside one transaction, requires the operator to re-enter the username, and rolls back on failure.
+
+Email notifications were also scoped in detail before implementation. A reliable system would have required a transactional email provider, an external cron trigger because the Render service can sleep, timezone-aware send logic, duplicate protection, and unsubscribe behavior.
+
+The feature was deliberately removed from scope. Its infrastructure cost was disproportionate to its portfolio value after OAuth and production deployment were complete.
+
+## Testing
+
+The project was verified through focused local and production checks covering:
+
+- Password and Google authentication
+- Daily, weekly, date-based, and repeated tasks
+- Coin awards and store purchases
+- Sprite pieces and discounted pack completion
+- Buddy linking, unlinking, and shared-task permissions
+- Comments, reactions, and cascading deletion
+- Cross-session WebSocket updates
+- SQLite and PostgreSQL migration behavior
+- Responsive task navigation and store layout
+- Transactional administrative user deletion
+- Live frontend, backend, database, and OAuth configuration
+
+Frontend changes were checked with production Vite builds, backend utilities were syntax-checked, and collaboration flows were exercised with separate user sessions.
+
+## Result
+
+The completed application provides:
+
+- Daily, weekly, and date-based task management
+- Optional repeats and private/shared visibility
+- Coin rewards and a cosmetic store
+- Individual sprite purchases and dynamic bundle discounts
+- Invite-code buddy linking
+- Shared tasks, comments, and emoji reactions
+- Real-time cross-user updates through WebSockets
+- Password and Google authentication
+- Verified-email account linking
+- Responsive mobile task navigation
+- SQLite local development and PostgreSQL production persistence
+- Alembic-managed schema evolution
+- Transactional administrative user deletion
+- Live Vercel, Render, and Neon deployments
+
+The project evolved from a gamified checklist into a production-shaped collaborative application. Its most valuable work was not any single feature, but the boundaries established between ownership and sharing, HTTP state and WebSocket invalidation, local convenience and production persistence, and worthwhile scope versus infrastructure that did not justify its cost.
